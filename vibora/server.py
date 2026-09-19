@@ -1,9 +1,12 @@
 import logging
+import os
+import resource
 import sys
 import traceback
 from email.utils import formatdate
 from collections import OrderedDict, deque
 from functools import partial
+from inspect import isawaitable
 from multiprocessing import cpu_count
 from .__version__ import __version__
 from .client import Session
@@ -11,7 +14,7 @@ from .workers.handler import RequestHandler
 from .workers.necromancer import Necromancer
 from .router import Route
 from .request import Request
-from .responses import Response
+from .responses import Response, JsonResponse
 from .sessions import SessionEngine
 from .templates.loader import TemplateLoader
 from .templates.extensions import ViboraNodes
@@ -25,6 +28,63 @@ from .application import Application
 class Vibora(Application):
 
     current_time: str = formatdate(timeval=None, localtime=False, usegmt=True)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.shutdown_callbacks = []
+
+    def register_shutdown_callback(self, callback):
+        """
+        Registers a callback (sync or async) to be executed during the graceful
+        shutdown process, after all connections and pending tasks are done.
+        Useful to release resources like database connections and caches.
+        :param callback:
+        :return:
+        """
+        self.shutdown_callbacks.append(callback)
+
+    async def run_shutdown_callbacks(self):
+        """
+        Executes all registered shutdown callbacks in registration order.
+        :return:
+        """
+        for callback in self.shutdown_callbacks:
+            result = callback()
+            if isawaitable(result):
+                await result
+
+    def health_status(self) -> dict:
+        """
+        Returns the current process health status.
+        :return:
+        """
+        memory_usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # Linux reports ru_maxrss in kilobytes while macOS reports it in bytes.
+        if sys.platform != 'darwin':
+            memory_usage *= 1024
+        return {
+            'status': 'ok',
+            'pid': os.getpid(),
+            'workers': len(self.workers),
+            'active_connections': len(self.connections),
+            'memory_usage': memory_usage,
+        }
+
+    def _add_health_check(self):
+        """
+        Registers the built-in /healthz endpoint so load balancers and
+        orchestrators can check the process health.
+        :return:
+        """
+        async def healthz(app: Vibora):
+            return JsonResponse(app.health_status())
+
+        # Skipping the built-in route if the user registered his own /healthz.
+        if b'/healthz' in self.router.routes.get(b'GET', {}):
+            return
+
+        route = Route(b'/healthz', healthz, methods=(b'GET',), parent=self, limits=self.limits, name='healthz')
+        self.router.add_route(route, {'': ''})
 
     def _add_default_routes(self):
         """
@@ -242,7 +302,8 @@ class Vibora(Application):
 
                 @app.handle(Events.AFTER_ENDPOINT)
                 async def access_logs(request: Request, response: Response):
-                    print(format_access_log(request, response), file=sys.stderr)
+                    request_id = request.context.get('request_id', '-')
+                    print(f'{format_access_log(request, response)} - {request_id}', file=sys.stderr)
 
     def initialize(self):
         """
@@ -254,6 +315,7 @@ class Vibora(Application):
         if self.debug_mode:
             self._turn_on_debug_features()
         self._add_default_routes()
+        self._add_health_check()
         self._add_default_error_handlers()
         self._configure_static_files()
         self._configure_sessions()

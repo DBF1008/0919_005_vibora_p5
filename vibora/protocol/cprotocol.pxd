@@ -60,6 +60,7 @@ cdef class Connection:
 
     # Custom protocol methods.
     cdef void handle_upgrade(self)
+    cdef void inject_request_id(self, Request request, Response response)
     cpdef void after_response(self, Response response)
     cpdef void resume_reading(self)
     cpdef void pause_reading(self)

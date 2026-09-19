@@ -78,6 +78,26 @@ class RequestHandler(Process):
                 timeout -= 1
                 await asyncio.sleep(1)
 
+            # Forcefully closing connections that didn't finish in time so
+            # no socket is left open when the loop stops.
+            for connection in self.app.connections.copy():
+                if not connection.is_closed():
+                    connection.close()
+
+            # Cancelling all pending tasks (db transactions, background jobs, etc)
+            # so no coroutine is left dangling when the loop stops.
+            current_task = asyncio.current_task()
+            pending_tasks = [task for task in asyncio.all_tasks()
+                             if task is not current_task and not task.done()]
+            for task in pending_tasks:
+                task.cancel()
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+            # Running user registered shutdown callbacks to release external
+            # resources like database connections, caches and file handles.
+            await self.app.run_shutdown_callbacks()
+
             loop.stop()
 
         def handle_kill_signal():
@@ -89,3 +109,8 @@ class RequestHandler(Process):
             loop.run_forever()
         except (SystemExit, KeyboardInterrupt):
             loop.stop()
+        finally:
+            # Closing the loop so async generators, transports and any other
+            # resource tied to it are properly finalized.
+            if not loop.is_closed():
+                loop.close()

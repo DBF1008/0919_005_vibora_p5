@@ -1,6 +1,7 @@
 #!python
 #cython: language_level=3, boundscheck=False, wraparound=False
 from time import time
+from uuid import uuid4
 from asyncio import Transport, Event, sleep, Task, CancelledError
 from ..parsers.errors import HttpParserError
 
@@ -91,6 +92,18 @@ cdef class Connection:
             )
         )
 
+    cdef void inject_request_id(self, Request request, Response response):
+        """
+        Injects the request id into the response headers so clients and
+        proxies can correlate logs across the whole request chain.
+        :param request:
+        :param response:
+        :return:
+        """
+        cdef object request_id = request.context.get('request_id')
+        if request_id and 'X-Request-ID' not in response.headers:
+            response.headers['X-Request-ID'] = request_id
+
     cpdef void after_response(self, Response response):
         """
         Handle network flow after a response is sent. Must be called after each response.
@@ -142,12 +155,14 @@ cdef class Connection:
         try:
             if not self.any_hooks and not cache_engine:
                 response = await route.call_handler(request, self.components)
+                self.inject_request_id(request, response)
                 return response.send(self)
 
             # Fast lane for async requests.
             if cache_engine and cache_engine.skip_hooks and cache_engine.is_async:
                 response = await cache_engine.get(request)
                 if response:
+                    self.inject_request_id(request, response)
                     response.send(self)
                     return
 
@@ -155,6 +170,7 @@ cdef class Connection:
             if self.before_endpoint_hooks:
                 response = await self.app.call_hooks(EVENTS_BEFORE_ENDPOINT, self.components, route=route)
                 if response:
+                    self.inject_request_id(request, response)
                     response.send(self)
                     return
 
@@ -182,6 +198,7 @@ cdef class Connection:
                     response = new_response
                     self.components.ephemeral_index[response.__class__] = response
 
+            self.inject_request_id(request, response)
             response.send(self)
 
             if self.after_send_response_hooks:
@@ -215,6 +232,13 @@ cdef class Connection:
         cdef Request request = self.request_class(url, headers, method, self.stream, self)
         cdef Route route = self.router.get_route(request)
 
+        # Full chain tracing: propagating the incoming request id or
+        # generating a new one so logs and responses can be correlated.
+        request_id = headers.get('x-request-id')
+        if not request_id:
+            request_id = uuid4().hex
+        request.context['request_id'] = request_id
+
         # Registering them as components to later use.
         ephemeral_components[self.request_class] = request
         ephemeral_components[Route] = route
@@ -236,6 +260,7 @@ cdef class Connection:
             if cache_engine and cache_engine.skip_hooks is True and not cache_engine.is_async:
                 response = cache_engine.get(request)
                 if response:
+                    self.inject_request_id(request, response)
                     response.send(self)
                     return
 
@@ -435,6 +460,9 @@ cdef class Connection:
             response = await route.parent.process_exception(exception, components)
         if response is None:
             response = await self.app.process_exception(exception, components)
+        request = self.components.ephemeral_index.get(self.request_class)
+        if request is not None:
+            self.inject_request_id(request, response)
         response.send(self)
 
 
