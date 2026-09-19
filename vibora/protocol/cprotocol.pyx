@@ -1,6 +1,8 @@
 #!python
 #cython: language_level=3, boundscheck=False, wraparound=False
 from time import time
+from uuid import uuid4
+import logging
 from asyncio import Transport, Event, sleep, Task, CancelledError
 from ..parsers.errors import HttpParserError
 
@@ -30,6 +32,8 @@ DEF PROCESSING_STATUS = 3
 DEF EVENTS_BEFORE_ENDPOINT = 3
 DEF EVENTS_AFTER_ENDPOINT  = 4
 DEF EVENTS_AFTER_RESPONSE_SENT  = 5
+logger = logging.getLogger('vibora.request')
+
 
 
 cdef class Connection:
@@ -58,6 +62,7 @@ cdef class Connection:
         self.closed = False
         self.last_task_time = time()
         self._stopped = False
+        self.request_id = None
 
         ##################################
         ## Early bindings for performance.
@@ -97,6 +102,7 @@ cdef class Connection:
         :return: None.
         """
         self.status = PENDING_STATUS
+        self.request_id = None
         if not self.keep_alive:
             self.close()
         elif self._stopped:
@@ -115,6 +121,18 @@ cdef class Connection:
         # Components like request and route objects are tied to the request flow so
         # after the response they are removed from this component engine.
         self.components.reset()
+
+    cpdef void send_response(self, Response response, Request request):
+        """
+        Sends a response after injecting the request id into the response
+        headers. Cached responses are emitted through a plain Response because
+        their optimized byte-cache is shared across requests.
+        """
+        cdef bytes request_id = self.request_id
+        if request_id:
+            _send_with_request_id(self, response, request_id)
+        else:
+            response.send(self)
 
     async def write(self, bytes data):
         """
@@ -142,20 +160,20 @@ cdef class Connection:
         try:
             if not self.any_hooks and not cache_engine:
                 response = await route.call_handler(request, self.components)
-                return response.send(self)
+                return self.send_response(response, request)
 
             # Fast lane for async requests.
             if cache_engine and cache_engine.skip_hooks and cache_engine.is_async:
                 response = await cache_engine.get(request)
                 if response:
-                    response.send(self)
+                    self.send_response(response, request)
                     return
 
             # Before endpoint hooks can halt the request (and prevent more hooks from being called)
             if self.before_endpoint_hooks:
                 response = await self.app.call_hooks(EVENTS_BEFORE_ENDPOINT, self.components, route=route)
                 if response:
-                    response.send(self)
+                    self.send_response(response, request)
                     return
 
             # Trying to fetch the response from route cache
@@ -182,7 +200,7 @@ cdef class Connection:
                     response = new_response
                     self.components.ephemeral_index[response.__class__] = response
 
-            response.send(self)
+            self.send_response(response, request)
 
             if self.after_send_response_hooks:
                 await self.app.call_hooks(EVENTS_AFTER_RESPONSE_SENT, self.components, route=route)
@@ -192,7 +210,7 @@ cdef class Connection:
             pass
         except Exception as error:
             self.components.ephemeral_index[type(error)] = error
-            task = self.handle_exception(error, self.components, route=route)
+            task = self.handle_exception(error, self.components, route=route, request=request)
             self.loop.create_task(task)
 
     #######################################################################
@@ -218,6 +236,14 @@ cdef class Connection:
         # Registering them as components to later use.
         ephemeral_components[self.request_class] = request
         ephemeral_components[Route] = route
+        # Full-chain tracing: honour an inbound X-Request-ID or generate a new one.
+        cdef object request_id = headers.get('X-Request-ID')
+        if not request_id:
+            request_id = uuid4().hex
+        self.request_id = request_id.encode() if isinstance(request_id, str) else request_id
+        request.context['request_id'] = request_id if isinstance(request_id, str) else request_id.decode()
+        logger.info('request started id=%s method=%s url=%s',
+                    request_id, method.decode(), url.decode())
 
         # # Updating HTTP parser security limits.
         limits = route.limits
@@ -236,10 +262,10 @@ cdef class Connection:
             if cache_engine and cache_engine.skip_hooks is True and not cache_engine.is_async:
                 response = cache_engine.get(request)
                 if response:
-                    response.send(self)
+                    self.send_response(response, request)
                     return
 
-            self.current_task = Task(self.handle_request(request, route), loop=self.loop)
+            self.current_task = self.loop.create_task(self.handle_request(request, route))
             self.current_task.components = self.components
 
             # Creating the timeout watcher.
@@ -422,7 +448,7 @@ cdef class Connection:
             await sleep(0.5)
         self.close()
 
-    async def handle_exception(self, object exception, object components, Route route = None):
+    async def handle_exception(self, object exception, object components, Route route = None, Request request = None):
         """
 
         :param exception:
@@ -435,7 +461,51 @@ cdef class Connection:
             response = await route.parent.process_exception(exception, components)
         if response is None:
             response = await self.app.process_exception(exception, components)
-        response.send(self)
+        if request is not None:
+            self.send_response(response, request)
+        else:
+            response.send(self)
+
+
+async def _wait_client_and_finish(Response response, Connection connection):
+    if not connection.writable:
+        await connection.write_permission.wait()
+    connection.after_response(response)
+
+
+def _send_with_request_id(Connection connection, Response response, bytes request_id):
+    cdef Response plain
+    cdef dict safe_headers
+    cdef object request_id_str = request_id.decode() if isinstance(request_id, bytes) else request_id
+    if request_id and isinstance(response, CachedResponse):
+        # Response.send slots are cdef polymorphic calls: re-wrapping a cached
+        # response still dispatches to the cached implementation which would
+        # build a shared byte-cache from mutated headers. We therefore emit the
+        # HTTP message directly and flow the connection through after_response.
+        plain = Response(
+            response.content,
+            status_code=response.status_code,
+            headers=dict(response.headers),
+            cookies=response.cookies
+        )
+        safe_headers = dict(plain.headers)
+        safe_headers['Content-Length'] = str(len(plain.content))
+        safe_headers['X-Request-ID'] = request_id_str
+        connection.transport.write(
+            (
+                f'HTTP/1.1 {plain.status_code} OK\r\n'
+                + ''.join(f'{h}: {v}\r\n' for h, v in safe_headers.items())
+                + '\r\n'
+            ).encode() + plain.content
+        )
+        if connection.writable is False:
+            connection.loop.create_task(_wait_client_and_finish(plain, connection))
+        else:
+            connection.after_response(plain)
+        return
+    if request_id:
+        response.headers.setdefault('X-Request-ID', request_id_str)
+    response.send(connection)
 
 
 def update_current_time() -> None:

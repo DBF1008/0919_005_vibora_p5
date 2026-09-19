@@ -39,6 +39,7 @@ cdef class Connection:
         StreamQueue queue
         object current_task
         object timeout_task
+        public object request_id
         ComponentsEngine components
         int last_task_time
 
@@ -61,6 +62,7 @@ cdef class Connection:
     # Custom protocol methods.
     cdef void handle_upgrade(self)
     cpdef void after_response(self, Response response)
+    cpdef void send_response(self, Response response, Request request)
     cpdef void resume_reading(self)
     cpdef void pause_reading(self)
     cpdef void cancel_request(self)

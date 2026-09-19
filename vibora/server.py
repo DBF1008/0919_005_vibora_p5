@@ -1,5 +1,8 @@
 import logging
+import os
+import resource
 import sys
+import time
 import traceback
 from email.utils import formatdate
 from collections import OrderedDict, deque
@@ -7,15 +10,17 @@ from functools import partial
 from multiprocessing import cpu_count
 from .__version__ import __version__
 from .client import Session
+from .responses import JsonResponse
 from .workers.handler import RequestHandler
 from .workers.necromancer import Necromancer
 from .router import Route
-from .request import Request
 from .responses import Response
 from .sessions import SessionEngine
 from .templates.loader import TemplateLoader
 from .templates.extensions import ViboraNodes
 from .exceptions import NotFound, MethodNotAllowed, MissingComponent
+from .request.request import Request as NativeRequest
+from .request import Request  # Python-level Request for type hints
 from .parsers.errors import BodyLimitError, HeadersLimitError
 from .utils import wait_server_available, get_free_port, cprint, pause, format_access_log
 from .hooks import Hook, Events
@@ -26,11 +31,61 @@ class Vibora(Application):
 
     current_time: str = formatdate(timeval=None, localtime=False, usegmt=True)
 
+    @staticmethod
+    def _get_memory_usage() -> dict:
+        """
+        Memory usage of the current worker process in bytes.
+        Works on Linux/macOS (RSS from getrusage) and falls back gracefully.
+        """
+        usage = {'rss_bytes': 0}
+        try:
+            usage['rss_bytes'] = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+            if sys.platform == 'darwin':
+                # ru_maxrss is reported in bytes on macOS, kilobytes on Linux.
+                pass
+            else:
+                usage['rss_bytes'] *= 1024
+        except Exception:
+            pass
+        try:
+            with open('/proc/self/status', 'r') as handle:
+                for line in handle:
+                    if line.startswith('VmRSS:'):
+                        usage['rss_bytes'] = int(line.split()[1]) * 1024
+                        break
+        except (OSError, IOError, ValueError):
+            pass
+        return usage
+
+    async def _healthz_handler(self, request: Request):
+        """
+        Process-level health status: worker count, active connections and memory.
+        Returns 503 while the worker is performing a graceful shutdown.
+        """
+        payload = {
+            'status': 'shutting_down' if getattr(self, 'shutting_down', False) else 'ok',
+            'pid': os.getpid(),
+            'workers': len(self.workers) or 1,
+            'active_connections': len(self.connections),
+            'memory': self._get_memory_usage(),
+            'uptime': int(time.time() - getattr(self, 'started_at', time.time())),
+            'request_id': request.context.get('request_id')
+        }
+        status_code = 200 if payload['status'] == 'ok' else 503
+        return JsonResponse(payload, status_code=status_code,
+                            headers={'X-Request-ID': request.context['request_id']})
+
     def _add_default_routes(self):
         """
 
         :return:
         """
+
+        # Built-in liveness/readiness probe. Skipped when the user already
+        # registered a route for the same path.
+        if not self.router.has_route(b'GET', b'/healthz'):
+            healthz_route = Route(b'/healthz', self._healthz_handler, parent=self, limits=self.limits)
+            self.router.add_route(healthz_route, {'': ''}, check_slashes=False)
 
         # 404 Not Found.
         async def not_found_handler():

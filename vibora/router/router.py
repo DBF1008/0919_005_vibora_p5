@@ -48,6 +48,12 @@ class Router:
         self.hosts = {}
         self.check_host = False
 
+    def has_route(self, method: bytes, pattern: bytes) -> bool:
+        """
+        Checks whether an exact (non-dynamic) route is already registered.
+        """
+        return pattern in self.routes.get(method, {})
+
     def _add_route_to_cache(self, route: 'Route'):
         """
 
